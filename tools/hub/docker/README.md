@@ -37,6 +37,10 @@ cp .env.example .env          # optional: port, threads, name, region
 docker compose up -d --build
 ```
 
+Or skip the build: put `NIGHTCOOP_IMAGE=ghcr.io/twenfys/nightcoop-hub:latest` into `.env`, then run
+`docker compose pull && docker compose up -d`. The image is built from
+[github.com/Twenfys/nightcoop-hub](https://github.com/Twenfys/nightcoop-hub), for x86-64 servers only.
+
 On the first start the hub creates its key in the `nightcoop-hub-data` volume and prints its fingerprint:
 
 ```sh
@@ -112,7 +116,8 @@ to your players. Whoever has the key file can pretend to be your hub.
   connections, packets and kilobytes per second, `cpu N%` — the share of one core that thread uses.
 - When a thread's `cpu` stays above ~60 % at your busy hours, give the hub more cores (and `NIGHTCOOP_SHARDS`) or add a second
   hub for part of your players.
-- Update: get the new sources, then `docker compose up -d --build`. Sessions outlive the restart: the host of each holds a
+- Update: get the new sources, then `docker compose up -d --build` (with the ready image: `docker compose pull &&
+  docker compose up -d`). Sessions outlive the restart: the host of each holds a
   resume pass signed with the hub's key and takes the same code back within 90 s, the guests come back by it (the key must
   stay the same — keep the volume). Players on a direct path keep playing meanwhile. Builds of the mod older than this hub
   lose sessions that go **through** the hub, so restart when it is quiet. `--resume off` turns passes off.

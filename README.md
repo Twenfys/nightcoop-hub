@@ -18,6 +18,9 @@ docker compose up -d --build
 docker compose logs hub | grep fingerprint
 ```
 
+No build: put `NIGHTCOOP_IMAGE=ghcr.io/twenfys/nightcoop-hub:latest` into `.env` and run
+`docker compose pull && docker compose up -d` instead (x86-64 servers).
+
 Open UDP **47800** and **47810–47873**, then give your players the address with the fingerprint, for example
 `hub.example.org#K3QF-9X2M-TV7A-0D4R`. In the game: the mod menu "Co-op" → "Server: …" → "Add an own server".
 

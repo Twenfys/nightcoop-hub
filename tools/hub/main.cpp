@@ -23,6 +23,10 @@
 // sent HubPayloads, the hub's CPU time (share of one core), counts (sessions created, joins, refusals). By default every
 // 300 s and only when there was something to count; 0 turns it off.
 // --max-clients: the ceiling of ENet connections (64 by default, ENet's limit is 4095). Other limits: HubServer::Limits.
+// --cpu-limit N: new sessions go only to threads under N % of a core (their share over the last seconds); with every
+// thread there, a new session is refused as "the hub is full" and the location answer says full — the client takes
+// another server. Joins and sessions coming back after a restart are not gated, only --max-clients holds them. 0
+// (default): no gate, as before 26.10.
 // --bench: a load test from one machine — per-address limits and closing silent connections are off.
 // --cookie: connection pass (src/HubCookie.hpp): pressure (default) — required while --cookie-busy slots are taken (half
 // of --max-clients by default); always — always (clients that carry no pass cannot get in: switch to it when "passes
@@ -988,8 +992,8 @@ void RunShard(nc::HubServer& aHub, const Options& aOptions, const std::string& a
                 const bool busy = st.datagramsIn || st.sessionsCreated || st.joinsAccepted || st.joinsRefused ||
                                   st.refusedLimits || st.refusedClosed || st.idleClosed || st.redirected || st.connectsRefused ||
                                   st.cookiesTold || st.guardPreAuth || st.guardPeerFull || st.guardPoolFull || st.intros ||
-                                  st.locationAsks || st.sessionsResumed || st.resumesRefused || aHub.SessionCount() ||
-                                  aHub.ClientCount();
+                                  st.locationAsks || st.sessionsResumed || st.resumesRefused || st.refusedBusy ||
+                                  aHub.SessionCount() || aHub.ClientCount();
                 // UDP/IP adds 28 bytes per datagram on top of ENet's count
                 if (aOptions.statsAlways || busy)
                     std::printf("%s %.1f s sessions %zu clients %zu | in %.0f dgram/s %.1f KB/s | out %.0f dgram/s "
@@ -1004,7 +1008,8 @@ void RunShard(nc::HubServer& aHub, const Options& aOptions, const std::string& a
                                 "closed for a full queue %llu | keys signed %llu, sealed codes %llu, sealed codes not "
                                 "opened %llu | identity shown %llu (with the hub list %llu, asks over the limit %llu) | "
                                 "locations asked %llu (with the list %llu, the list did not fit %llu) | resume passes given "
-                                "%llu, sessions brought back %llu, resumes refused %llu\n",
+                                "%llu, sessions brought back %llu, resumes refused %llu | new sessions refused as busy %llu "
+                                "(--cpu-limit %u%%), the thread's share of a core now %.1f%%\n",
                                 aLabel.c_str(), span, aHub.SessionCount(), aHub.ClientCount(), st.datagramsIn / span,
                                 (st.bytesIn + 28.0 * st.datagramsIn) / 1024.0 / span, st.datagramsOut / span,
                                 (st.bytesOut + 28.0 * st.datagramsOut) / 1024.0 / span, st.payloadsIn / span,
@@ -1041,7 +1046,9 @@ void RunShard(nc::HubServer& aHub, const Options& aOptions, const std::string& a
                                 static_cast<unsigned long long>(st.locationTooBig),
                                 static_cast<unsigned long long>(st.passesGiven),
                                 static_cast<unsigned long long>(st.sessionsResumed),
-                                static_cast<unsigned long long>(st.resumesRefused));
+                                static_cast<unsigned long long>(st.resumesRefused),
+                                static_cast<unsigned long long>(st.refusedBusy),
+                                static_cast<unsigned>(aHub.GetLimits().cpuLimitPct), aHub.CpuPermille() / 10.0);
                 statsAt = now;
                 statsCpu = cpu;
                 peakClients = aHub.ClientCount() + aHub.IdleCount();
@@ -1205,6 +1212,8 @@ int main(int argc, char** argv)
         }
         else if (arg == "--max-clients" && more)
             limits.maxClients = static_cast<size_t>(std::clamp(std::atoi(argv[++i]), 1, 4095));
+        else if (arg == "--cpu-limit" && more)
+            limits.cpuLimitPct = static_cast<uint8_t>(std::clamp(std::atoi(argv[++i]), 0, 100));
         else if (arg == "--max-per-address" && more)
             limits.maxPerAddress = static_cast<size_t>(std::clamp(std::atoi(argv[++i]), 0, 4095));
         else if (arg == "--max-sessions" && more)

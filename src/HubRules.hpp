@@ -955,6 +955,64 @@ inline constexpr const char* kReasonTooManyCreates = "too many sessions from you
 /// A join to a code the hub does not know
 inline constexpr const char* kReasonNoSession = "no such session";
 
+/// 26.10 (hub_cpu_gate; the owner: "raise the per-core limit to 75–80 %; once there, no new sessions open, but players can
+/// still join the existing ones"). A hub thread holds its sessions alone; on 25.10 at 19:20 Limburg ran out of connection
+/// slots (512 a thread) with its busiest thread at 44 % of a core. Now the slots are not the limit (nightcoop-hub.service:
+/// --max-clients 1024), the core is: a thread takes new sessions while its share of a core is under --cpu-limit. Joins
+/// and sessions coming back after a restart of the hub are not gated — only the slots hold them.
+///
+/// A thread's share of a core, ‰, smoothed: one sample a second, a quarter of it each time (half of a step in ~2.5 s), so
+/// one heavy second does not shut the hub
+inline uint16_t CpuSmooth(uint16_t aOld, uint32_t aSample)
+{
+    const uint32_t sample = std::min<uint32_t>(aSample, 1000u);
+    return static_cast<uint16_t>((aOld * 3u + sample + 2u) / 4u);
+}
+
+/// A thread takes a new session (aLimitPct 0: no gate, as before 26.10)
+inline bool CpuOpen(uint16_t aCpuPermille, uint8_t aLimitPct)
+{
+    return aLimitPct == 0 || aCpuPermille < static_cast<uint32_t>(aLimitPct) * 10u;
+}
+
+/// The thread for a new session: the fewest connections among the threads under the CPU limit; the asking thread (aSelf,
+/// aOwnLoad — its connections without the asker) wins a tie, so there is no extra hop. aUsable[i] false: the thread has no
+/// port. -1: every thread is at the limit — the hub takes no new session now
+inline int PickOpenThread(const uint32_t* aLoads, const uint16_t* aCpus, const bool* aUsable, size_t aCount, size_t aSelf,
+                          uint32_t aOwnLoad, uint8_t aLimitPct)
+{
+    int best = -1;
+    uint32_t bestLoad = 0;
+    if (aSelf < aCount && aUsable[aSelf] && CpuOpen(aCpus[aSelf], aLimitPct))
+    {
+        best = static_cast<int>(aSelf);
+        bestLoad = aOwnLoad;
+    }
+    for (size_t i = 0; i < aCount; ++i)
+    {
+        if (i == aSelf || !aUsable[i] || !CpuOpen(aCpus[i], aLimitPct))
+            continue;
+        if (best < 0 || aLoads[i] < bestLoad)
+        {
+            best = static_cast<int>(i);
+            bestLoad = aLoads[i];
+        }
+    }
+    return best;
+}
+
+/// The hub's fill for the server picker and the bot: the larger of its connections against the slots and the least busy
+/// thread's share of the CPU limit — 100 % means the hub takes no new session. 255: no slots (unknown)
+inline uint8_t FillPercent(size_t aConnections, size_t aCapacity, uint16_t aLeastCpuPermille, uint8_t aLimitPct)
+{
+    if (aCapacity == 0)
+        return 255;
+    size_t fill = aConnections * 100 / aCapacity;
+    if (aLimitPct)
+        fill = std::max<size_t>(fill, static_cast<size_t>(aLeastCpuPermille) * 10u / aLimitPct);
+    return static_cast<uint8_t>(std::min<size_t>(fill, 100));
+}
+
 /// Pass flags
 inline constexpr uint8_t kResumePassEncrypts = 1u << 0; ///< the host encrypts its links (its key is signed in HubPeerUp)
 
@@ -1104,6 +1162,60 @@ inline const char* ResumeReason(ResumeVerdict aVerdict)
 inline uint32_t ResumeNextId(uint32_t aAsked)
 {
     return std::clamp<uint32_t>(aAsked, 1, kResumeMaxNextId);
+}
+
+// 13.11 (security review): the low byte of a peer number is its "creator" in the session's entity numbers
+// (Protocol.hpp NpcNetId / VehicleNetId: peer & 0xFF in the top byte; SdkSpawnsRules / SdkCoopRules: "ours" / "theirs" by that
+// byte; Vehicles: byte 0xFE — a scene car). Numbers went up by one on every join, without a limit: after 255 joins and leaves a
+// guest got byte 0 (the host's), 0xFE (scene cars) or the byte of another guest still playing — two entities of two creators
+// under one number at the others, also by itself in a long session with reconnects. A number is never given twice in a session:
+// the host remembers every number it welcomed (Session: m_welcomed, m_knownClients — a second Hello under a welcomed number is
+// refused) and the relay maps hub numbers to game ones (RelayTransport m_hubToGame, m_staleHubIds: "the hub does not reuse
+// numbers"). So the next number is the smallest not given yet whose low byte is usable and free: not 0 (the host), not 0xFE
+// (scene cars), not 0xFF (all ones: proto::kAllPeers / kHubBroadcast / kNoKiller end in it), not the byte of a live participant
+// and not the byte of one who left less than kPeerByteHoldMs ago — the host keeps a gone guest's place that long
+// (Session::kAwayGraceMs, the same 90 s as kResumeWindowMs), then gives it up and every partner drops its entities (Bye).
+
+/// A departed participant's low byte stays taken this long (see above)
+inline constexpr uint64_t kPeerByteHoldMs = kResumeWindowMs;
+/// Numbers from here up are not participants (Transport.hpp kFirstReservedPeer)
+inline constexpr uint32_t kPeerNumberCeiling = 0xFFFF'FFF0u;
+
+/// The low byte may be a participant's
+inline constexpr bool PeerByteUsable(uint8_t aByte)
+{
+    return aByte != 0x00 && aByte != 0xFE && aByte != 0xFF;
+}
+
+/// The smallest number from aFrom (numbers below are given already) below aCeiling whose low byte is usable and not in aTaken
+/// (bytes of live participants and of the recently gone). 0 — none: every usable byte is taken (the session is full of
+/// numbers until a hold ends).
+inline uint32_t NextPeerNumber(uint32_t aFrom, const std::array<bool, 256>& aTaken, uint32_t aCeiling = kPeerNumberCeiling)
+{
+    uint32_t id = std::max<uint32_t>(aFrom, 1);
+    for (uint32_t step = 0; step < 256 && id < aCeiling; ++step, ++id)
+    {
+        const auto byte = static_cast<uint8_t>(id & 0xFF);
+        if (PeerByteUsable(byte) && !aTaken[byte])
+            return id;
+    }
+    return 0;
+}
+
+/// Departed numbers whose hold is over go; the rest mark their bytes in aTaken. aHeld: number -> until (ms)
+template<typename Map>
+inline void TakeHeldBytes(Map& aHeld, uint64_t aNowMs, std::array<bool, 256>& aTaken)
+{
+    for (auto it = aHeld.begin(); it != aHeld.end();)
+    {
+        if (aNowMs >= it->second)
+        {
+            it = aHeld.erase(it);
+            continue;
+        }
+        aTaken[it->first & 0xFF] = true;
+        ++it;
+    }
 }
 
 /// The host's next step after a refusal: true — try again (the session's old host connection still lingers at the hub

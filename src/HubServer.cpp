@@ -9,6 +9,12 @@
 
 #include <enet/enet.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -42,7 +48,29 @@ constexpr uint64_t kDueQueue = 0x4855'4252'4550'000Dull;
 constexpr uint64_t kDueClosed = 0x4855'4252'4550'000Full;
 constexpr uint64_t kDueResume = 0x4855'4252'4550'0010ull;
 constexpr uint64_t kDueResumeLimit = 0x4855'4252'4550'0011ull;
+constexpr uint64_t kDueBusy = 0x4855'4252'4550'0012ull;
 constexpr uint64_t kDueEveryMs = 10000;
+/// At most this long the stopping hub hands out what is queued (hub_stop_drain): a far player's acknowledgement takes a
+/// few hundred ms; whoever is not through by then is cut as before
+constexpr uint64_t kStopDrainMs = 1500;
+
+/// CPU time of the calling thread, µs: a hub thread's own share of a core (hub_cpu_gate; the process clock would sum them)
+uint64_t ThreadCpuUs()
+{
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
+        return 0;
+    const auto ticks = [](const FILETIME& aTime)
+    { return (static_cast<uint64_t>(aTime.dwHighDateTime) << 32) | aTime.dwLowDateTime; };
+    return (ticks(kernel) + ticks(user)) / 10u;
+#else
+    timespec spent{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &spent) != 0)
+        return 0;
+    return static_cast<uint64_t>(spent.tv_sec) * 1000000u + static_cast<uint64_t>(spent.tv_nsec) / 1000u;
+#endif
+}
 
 /// Packets sent by the hub, for TakeStats. Each hub thread counts its own (one HubServer per thread: its thread calls
 /// Service and TakeStats)
@@ -243,10 +271,50 @@ std::shared_ptr<const HubLocationsSource::Data> HubLocationsSource::Get() const
 }
 
 HubShards::HubShards(std::vector<uint16_t> aPorts)
-    : m_ports(std::move(aPorts)), m_load(new std::atomic<uint32_t>[m_ports.size() ? m_ports.size() : 1])
+    : m_ports(std::move(aPorts)), m_load(new std::atomic<uint32_t>[m_ports.size() ? m_ports.size() : 1]),
+      m_cpu(new std::atomic<uint16_t>[m_ports.size() ? m_ports.size() : 1])
 {
     for (size_t i = 0; i < m_ports.size(); ++i)
+    {
         m_load[i].store(0, std::memory_order_relaxed);
+        m_cpu[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+void HubShards::SetCpu(size_t aShard, uint16_t aPermille)
+{
+    if (aShard < m_ports.size())
+        m_cpu[aShard].store(aPermille, std::memory_order_relaxed);
+}
+
+uint16_t HubShards::CpuOf(size_t aShard) const
+{
+    return aShard < m_ports.size() ? m_cpu[aShard].load(std::memory_order_relaxed) : 0;
+}
+
+uint16_t HubShards::LeastCpu() const
+{
+    uint16_t least = 1000;
+    for (size_t i = 0; i < m_ports.size(); ++i)
+        if (m_ports[i] != 0)
+            least = std::min(least, m_cpu[i].load(std::memory_order_relaxed));
+    return least;
+}
+
+int HubShards::PickOpen(size_t aSelf, uint32_t aOwnLoad, uint8_t aLimitPct) const
+{
+    // At most 64 threads (tools/hub/main.cpp --shards)
+    std::array<uint32_t, 64> loads{};
+    std::array<uint16_t, 64> cpus{};
+    std::array<bool, 64> usable{};
+    const size_t count = std::min<size_t>(m_ports.size(), loads.size());
+    for (size_t i = 0; i < count; ++i)
+    {
+        loads[i] = m_load[i].load(std::memory_order_relaxed);
+        cpus[i] = m_cpu[i].load(std::memory_order_relaxed);
+        usable[i] = m_ports[i] != 0;
+    }
+    return hubrules::PickOpenThread(loads.data(), cpus.data(), usable.data(), count, aSelf, aOwnLoad, aLimitPct);
 }
 
 void HubShards::SetLoad(size_t aShard, uint32_t aConnections)
@@ -418,6 +486,13 @@ bool HubServer::Start(uint16_t aPort, const Limits& aLimits, HubShards* aShards,
               aPort, m_limits.maxClients, m_limits.maxPerAddress, m_limits.maxSessions, m_limits.maxGuests,
               m_limits.maxPacketBytes / 1024, m_limits.maxWaitingBytes / 1024, m_limits.idleMs / 1000,
               m_limits.joinFailsPerMinute, m_limits.createsPerMinute);
+    if (m_limits.cpuLimitPct)
+        log::Info("hub: new sessions go to threads under {}% of a core (--cpu-limit); with every thread there a new session "
+                  "is refused as \"{}\" and the server picker takes another server — guests still join the sessions here, "
+                  "and sessions come back after a restart, up to {} connection(s) a thread",
+                  m_limits.cpuLimitPct, hubrules::kReasonHubFull, m_limits.maxClients);
+    else
+        log::Info("hub: new sessions are not gated by the threads' share of a core (--cpu-limit 0 — as before 26.10)");
     if (m_guard)
         log::Info("hub: undelivered data in ENet queues is limited before ENet takes it — {} KB per connection with the "
                   "packet that brings it, {} KB its own and a pool of {} MB over that for the thread; a connection "
@@ -466,10 +541,65 @@ bool HubServer::Start(uint16_t aPort, const Limits& aLimits, HubShards* aShards,
     return true;
 }
 
+void HubServer::DrainBeforeStop()
+{
+    size_t asked = 0;
+    for (size_t i = 0; i < m_host->peerCount; ++i)
+    {
+        ENetPeer* peer = &m_host->peers[i];
+        if (peer->state == ENET_PEER_STATE_CONNECTED)
+        {
+            enet_peer_disconnect_later(peer, 0);
+            ++asked;
+        }
+    }
+    if (!asked)
+        return;
+    const uint64_t start = NowMs();
+    size_t closed = 0;
+    size_t refused = 0;
+    ENetEvent event;
+    while (NowMs() - start < kStopDrainMs)
+    {
+        bool open = false;
+        for (size_t i = 0; i < m_host->peerCount && !open; ++i)
+            open = m_host->peers[i].state != ENET_PEER_STATE_DISCONNECTED;
+        if (!open)
+            break;
+        t_serving = this;
+        const int got = enet_host_service(m_host, &event, 10);
+        t_serving = nullptr;
+        if (got <= 0)
+            continue;
+        switch (event.type)
+        {
+        case ENET_EVENT_TYPE_RECEIVE:
+            // Not relayed any more: its recipients are on their way out too (the client keeps what it sends meanwhile)
+            enet_packet_destroy(event.packet);
+            break;
+        case ENET_EVENT_TYPE_CONNECT:
+            enet_peer_disconnect_now(event.peer, 0);
+            ++refused;
+            break;
+        case ENET_EVENT_TYPE_DISCONNECT:
+            ++closed;
+            break;
+        default:
+            break;
+        }
+    }
+    log::Info("hub: stopping — {} of {} connection(s) took what was queued for them and closed in {} ms (the rest are cut "
+              "now; at most {} ms), {} new connection(s) turned away meanwhile (hub_stop_drain)",
+              closed, asked, NowMs() - start, kStopDrainMs, refused);
+}
+
 void HubServer::Stop()
 {
     if (m_host)
     {
+        // 26.10 (hub_stop_drain, probe of a restart with a «mission»): what the hub has taken from one player and not yet
+        // handed to another goes out before the DISCONNECT — before, disconnect_now dropped the relayed messages in flight
+        DrainBeforeStop();
         // A DISCONNECT to every client: without it clients learn that the hub left only by ENet's timeout (30–60 s)
         for (size_t i = 0; i < m_host->peerCount; ++i)
         {
@@ -598,6 +728,36 @@ void HubServer::Service(uint32_t aTimeoutMs)
     // The thread's load, for the other threads of the hub: it picks the thread of a new session
     if (m_shards)
         m_shards->SetLoad(m_shard, static_cast<uint32_t>(m_clients.size() + m_idle.size()));
+    MeasureCpu(now);
+}
+
+void HubServer::MeasureCpu(uint64_t aNowMs)
+{
+    if (m_cpuMarkMs && aNowMs < m_cpuMarkMs + 1000)
+        return;
+    const uint64_t cpuUs = ThreadCpuUs();
+    // µs of CPU per ms of wall time is the share of a core in ‰
+    if (m_cpuMarkMs && aNowMs > m_cpuMarkMs && cpuUs >= m_cpuMarkUs)
+    {
+        const uint64_t sample = (cpuUs - m_cpuMarkUs) / (aNowMs - m_cpuMarkMs);
+        m_cpuPermille = hubrules::CpuSmooth(m_cpuPermille, static_cast<uint32_t>(std::min<uint64_t>(sample, 1000)));
+        if (m_shards)
+            m_shards->SetCpu(m_shard, m_cpuPermille);
+    }
+    m_cpuMarkMs = aNowMs;
+    m_cpuMarkUs = cpuUs;
+}
+
+void HubServer::RefuseBusy(ENetPeer* aPeer)
+{
+    ++m_stats.refusedBusy;
+    Reject(aPeer, hubrules::kReasonHubFull);
+    if (log::Due(kDueBusy, kDueEveryMs))
+        log::Info("hub: refused a new session from {}: {} — every thread of the hub is at {}% of a core or more "
+                  "(--cpu-limit; this one {:.1f}%), the client takes another server; guests still join the {} session(s) "
+                  "here ({} refused as busy since the last count)",
+                  AddressText(aPeer->address.host), hubrules::kReasonHubFull, m_limits.cpuLimitPct, m_cpuPermille / 10.0,
+                  m_sessions.size(), m_stats.refusedBusy);
 }
 
 void HubServer::CountBusy(uint64_t aNowMs)
@@ -633,18 +793,23 @@ std::vector<uint8_t> HubServer::AnswerLocations(const uint8_t* aAsk, size_t aSiz
     // the entry port)
     size_t connections = ClientCount() + IdleCount();
     size_t capacity = m_limits.maxClients;
+    uint16_t leastCpu = m_cpuPermille;
+    bool cpuFull = !hubrules::CpuOpen(m_cpuPermille, m_limits.cpuLimitPct);
     if (m_shards)
     {
         connections = 0;
         for (size_t i = 0; i < m_shards->Count(); ++i)
             connections += m_shards->LoadOf(i);
         capacity = m_limits.maxClients * m_shards->Count();
+        leastCpu = m_shards->LeastCpu();
+        cpuFull = m_shards->PickOpen(m_shard, 0, m_limits.cpuLimitPct) < 0;
     }
-    tell.load = capacity ? static_cast<uint8_t>(std::min<size_t>(100, connections * 100 / capacity)) : 255;
+    // Fill: connections against the slots or the least busy thread's share of the CPU limit, whichever is more (hub_cpu_gate)
+    tell.load = hubrules::FillPercent(connections, capacity, leastCpu, m_limits.cpuLimitPct);
     tell.sessions = static_cast<uint16_t>(std::min<size_t>(65535, SessionCount()));
-    // Full: connections nearly at the ceiling (a new session is a host and guests) or sessions at the thread's limit. Closed:
-    // its line in the location list says so (no new sessions)
-    const bool full = capacity && (connections + 2 > capacity ||
+    // Full: connections nearly at the ceiling (a new session is a host and guests), sessions at the thread's limit or every
+    // thread at the CPU limit. Closed: its line in the location list says so (no new sessions)
+    const bool full = capacity && (connections + 2 > capacity || cpuFull ||
                                    (!m_shards && m_limits.maxSessions && SessionCount() >= m_limits.maxSessions));
     const auto list = m_locations ? m_locations->Get() : nullptr;
     tell.state = list && list->closedHere ? hubrules::LocState::Closed
@@ -1095,6 +1260,8 @@ void HubServer::DropClient(ENetPeer* aPeer)
     }
 
     session.guests.erase(client.id);
+    // 13.11: its low byte stays taken while the host keeps its place (hubrules::kPeerByteHoldMs)
+    session.held[client.id] = NowMs() + hubrules::kPeerByteHoldMs;
     NotifyHost(session, static_cast<uint8_t>(proto::MsgType::HubPeerDown), client.id);
     log::Info("hub: peer {} left session {} ({} remaining)", client.id, client.code, session.guests.size());
 }
@@ -1147,17 +1314,30 @@ void HubServer::HandlePacket(ENetPeer* aPeer, const uint8_t* aData, size_t aSize
                           AddressText(aPeer->address.host), m_stats.refusedClosed, m_sessions.size());
             return;
         }
-        // Hub threads: a new session goes to the least loaded thread. A client that understands redirects goes there itself and
-        // repeats the request marked "already redirected"; an older client is served here
+        // Hub threads: a new session goes to the least loaded thread under the CPU limit (hub_cpu_gate); with every thread at
+        // the limit the hub takes none now. A client that understands redirects goes there itself and repeats the request
+        // marked "already redirected" (that thread was under the limit a moment ago: taken as is); an older client and a
+        // single hub are served here if this thread is under the limit
         if (m_shards && (caps & proto::kHubCapRedirect) && !(caps & proto::kHubCapPlaced))
         {
             const size_t connections = m_clients.size() + m_idle.size();
-            const size_t target = m_shards->Pick(m_shard, static_cast<uint32_t>(connections ? connections - 1 : 0));
-            if (target != m_shard)
+            const int target =
+                m_shards->PickOpen(m_shard, static_cast<uint32_t>(connections ? connections - 1 : 0), m_limits.cpuLimitPct);
+            if (target < 0)
             {
-                Redirect(aPeer, target);
+                RefuseBusy(aPeer);
                 return;
             }
+            if (static_cast<size_t>(target) != m_shard)
+            {
+                Redirect(aPeer, static_cast<size_t>(target));
+                return;
+            }
+        }
+        else if (!(caps & proto::kHubCapPlaced) && !hubrules::CpuOpen(m_cpuPermille, m_limits.cpuLimitPct))
+        {
+            RefuseBusy(aPeer);
+            return;
         }
         const uint64_t now = NowMs();
         const bool tooMany =
@@ -1353,7 +1533,27 @@ void HubServer::HandlePacket(ENetPeer* aPeer, const uint8_t* aData, size_t aSize
                           session.guests.size());
             return;
         }
-        const uint32_t id = session.nextId++;
+        // 13.11 (security review; hubrules::NextPeerNumber): the smallest number not given yet whose low byte — the
+        // "creator" in entity numbers — is usable and not the byte of a live guest or of one who left less than the host's
+        // grace ago
+        std::array<bool, 256> taken{};
+        taken[0] = true; // the host
+        for (const auto& [guestId, guestPeer] : session.guests)
+            taken[guestId & 0xFF] = true;
+        hubrules::TakeHeldBytes(session.held, now, taken);
+        const uint32_t id = hubrules::NextPeerNumber(session.nextId, taken);
+        if (!id)
+        {
+            ++m_stats.joinsRefused;
+            ++m_stats.refusedLimits;
+            Reject(aPeer, "the session is full");
+            if (log::Due(kDueLimit, kDueEveryMs))
+                log::Warn("hub: refused a join to session {}: no free peer number — every usable low byte is taken by a guest "
+                          "or one who left less than {} s ago ({} held)",
+                          code, hubrules::kPeerByteHoldMs / 1000, session.held.size());
+            return;
+        }
+        session.nextId = id + 1;
         session.guests[id] = aPeer;
         m_clients[aPeer] = Client{code, id, false};
         m_idle.erase(aPeer);

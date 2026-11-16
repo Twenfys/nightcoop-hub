@@ -56,8 +56,17 @@ inline constexpr size_t kSealHeader = 1 + 8;
 /// Cost per message: 25 bytes (mark 1 + counter 8 + tag 16)
 inline constexpr size_t kOverhead = kSealHeader + kTagSize;
 /// Replay window per direction, in messages: unreliable messages arrive out of order, and the two paths (hub and
-/// direct) have different delays. 4096 is ~10 s of a 400 messages/s stream
-inline constexpr uint64_t kReplayWindow = 4096;
+/// direct) have different delays. 23.10: one counter serves both ENet channels, and after a lost packet ENet holds every later reliable message
+/// until the resend while the unreliable ones go on and move the window. At 4096 a direct link of ~1350 messages/s
+/// dropped such a held batch as "too old" after ~3 s, though ENet had acknowledged it — lost for good (votes, pause
+/// releases, facts). 2^18 covers ENet's own patience with a link (enet_peer_timeout up to 60 s) at up to ~4000
+/// messages/s; 32 KiB per direction
+inline constexpr uint64_t kReplayWindow = uint64_t{1} << 18;
+/// The window before 23.10 (net_replay_wide off)
+inline constexpr uint64_t kReplayWindowNarrow = 4096;
+/// Switch net_replay_wide (on by default; at once, on receiving only — the wire is the same): a late counter is taken
+/// within kReplayWindow newer ones; off — within kReplayWindowNarrow, as before 23.10
+inline std::atomic<bool> g_replayWide{true};
 /// How long to wait for the partner's CryptoHello, ms: then without encryption (where authenticity cannot be checked
 /// anyway) or a refusal
 inline constexpr uint64_t kHelloWaitMs = 8000;
@@ -525,10 +534,18 @@ public:
     bool Fresh(uint64_t aCounter) const;
     void Mark(uint64_t aCounter);
     uint64_t Top() const { return m_top; }
+    /// Refused by Fresh as older than the window, not as a repeat
+    bool TooOld(uint64_t aCounter) const;
+    /// How many newer counters a late one may be behind now (net_replay_wide)
+    static uint64_t Span();
+    /// Empty again (the bits keep their memory)
+    void Reset();
 
 private:
     uint64_t m_top = 0; ///< the newest accepted (0: none yet)
-    std::array<uint64_t, kReplayWindow / 64> m_bits{};
+    /// kReplayWindow bits (32 KiB) on the heap from the first accepted counter: a link stays small — the tests keep
+    /// many on the stack, the transport moves them through it
+    std::vector<uint64_t> m_bits;
 };
 
 // ---------------------------------------------------------------- tails of the talk with the hub
@@ -688,6 +705,8 @@ public:
         uint64_t openNs = 0;
         uint64_t failed = 0;   ///< failed the check (tampering, a foreign key)
         uint64_t replayed = 0; ///< a replay or older than the window
+        uint64_t tooOld = 0;   ///< of replayed: older than the window
+        uint64_t late = 0;     ///< opened behind more than kReplayWindowNarrow newer ones (net_replay_wide)
         uint64_t plain = 0;    ///< plain after the handshake
         uint64_t early = 0;    ///< sealed before our keys were ready
         uint64_t heldDropped = 0;
@@ -699,6 +718,9 @@ public:
     {
         return m_stats.failed + m_stats.replayed + m_stats.plain + m_stats.early != m_droppedReported;
     }
+    /// Opened late since the last call (net_replay_wide; for a rare log line), and whether there is any
+    uint64_t TakeLate();
+    bool PendingLate() const { return m_stats.late != m_lateReported; }
 
     /// For tests: the next send counter (overflow)
     void TestSetNextCounter(uint64_t aCounter) { m_txNext = aCounter; }
@@ -735,6 +757,7 @@ private:
     size_t m_heldBytes = 0;
     Stats m_stats;
     uint64_t m_droppedReported = 0;
+    uint64_t m_lateReported = 0;
 };
 
 /// A synthesized session refusal for a guest (MsgType::Reject "encryption: …"): the transport hands it to the session as

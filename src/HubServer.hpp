@@ -123,9 +123,16 @@ public:
     /// A thread's load is its number of connections; the thread itself writes it every turn
     void SetLoad(size_t aShard, uint32_t aConnections);
     uint32_t LoadOf(size_t aShard) const;
+    /// A thread's share of a core, ‰, smoothed (hub_cpu_gate); the thread itself writes it once a second
+    void SetCpu(size_t aShard, uint16_t aPermille);
+    uint16_t CpuOf(size_t aShard) const;
+    /// The least busy thread's share of a core, ‰ (threads with a port)
+    uint16_t LeastCpu() const;
     /// The thread for a new session: the least loaded among those less loaded than the own one (aOwnLoad: the own thread's
     /// connections without the asker); if there is none, aSelf — no extra hop
     size_t Pick(size_t aSelf, uint32_t aOwnLoad) const;
+    /// The same among the threads under aLimitPct of a core (hubrules::PickOpenThread); -1: every thread is at the limit
+    int PickOpen(size_t aSelf, uint32_t aOwnLoad, uint8_t aLimitPct) const;
     /// Binds a code to a thread. False: the code exists already (on any thread)
     bool Register(const std::string& aCode, size_t aShard);
     void Unregister(const std::string& aCode);
@@ -136,6 +143,7 @@ public:
 private:
     std::vector<uint16_t> m_ports;
     std::unique_ptr<std::atomic<uint32_t>[]> m_load;
+    std::unique_ptr<std::atomic<uint16_t>[]> m_cpu;
     std::mutex m_mutex;
     std::unordered_map<std::string, size_t> m_codes;
     HubAddressBook m_book;
@@ -241,6 +249,10 @@ public:
         /// the hub's key and brings the session back with it. Needs the key (SetKeys). Off (--resume off): no passes, and
         /// HubResumeSession / HubResumeAsk are skipped silently, as by a hub that does not know them
         bool resume = true;
+        /// New sessions go only to threads under this share of a core, % (hub_cpu_gate, HubRules.hpp CpuOpen): with every
+        /// thread there, a new session is refused as kReasonHubFull and the location answer says Full — the client's server
+        /// picker takes another server. Joins and sessions coming back are not gated. 0: no gate (as before 26.10)
+        uint8_t cpuLimitPct = 0;
     };
 
     /// Binds the port. 64 connections are eight full sessions (a host and seven guests)
@@ -250,7 +262,8 @@ public:
     bool Start(uint16_t aPort, const Limits& aLimits, HubShards* aShards = nullptr, size_t aShard = 0);
     /// One turn: waits for the first event no longer than aTimeoutMs, then handles what has accumulated
     void Service(uint32_t aTimeoutMs);
-    /// Close: clients get a DISCONNECT and learn at once that the hub left, not by timeout
+    /// Close: clients get a DISCONNECT and learn at once that the hub left, not by timeout. What the hub has taken from one
+    /// player and not yet handed to another goes out first (DrainBeforeStop)
     void Stop();
 
     bool IsRunning() const { return m_host != nullptr; }
@@ -259,6 +272,9 @@ public:
     size_t ClientCount() const { return m_clients.size(); }
     /// Connections that have neither created nor joined a session yet
     size_t IdleCount() const { return m_idle.size(); }
+    /// This thread's share of a core, ‰, smoothed (hub_cpu_gate; Service measures it once a second)
+    uint16_t CpuPermille() const { return m_cpuPermille; }
+    const Limits& GetLimits() const { return m_limits; }
 
     /// Counts since the last TakeStats (nightcoop_hub --stats): datagrams and bytes of ENet's UDP payload (its headers
     /// included, UDP/IP not), received HubPayloads, packets sent by the hub (a relay sends one per recipient)
@@ -279,6 +295,7 @@ public:
         uint64_t joinsRefused = 0;   ///< no such session, another protocol, the session is full
         uint64_t refusedLimits = 0;  ///< refused by a hub limit: sessions, creations and joins per address
         uint64_t refusedClosed = 0;  ///< new sessions refused: this hub is closed in the location list
+        uint64_t refusedBusy = 0;    ///< new sessions refused: every thread at the CPU limit (hub_cpu_gate)
         uint64_t ignoredRepeats = 0; ///< a repeated HubCreateSession / HubJoinSession from a connection already in a session
         uint64_t idleClosed = 0;     ///< connections closed without announcing themselves
         uint64_t payloadsDropped = 0; ///< HubPayload from a connection outside a session
@@ -350,7 +367,10 @@ private:
         _ENetPeer* host = nullptr;
         /// Peer number inside the session -> its connection. The host is always 0 and is not in this map
         std::unordered_map<uint32_t, _ENetPeer*> guests;
+        /// The smallest number not given yet (13.11: the next one is hubrules::NextPeerNumber from here)
         uint32_t nextId = 1;
+        /// 13.11: numbers of guests who left -> until when their low byte stays taken (hubrules::kPeerByteHoldMs)
+        std::unordered_map<uint32_t, uint64_t> held;
         /// The host's game protocol: a guest with another one is not let in
         uint32_t version = 0;
         /// Encryption: the session's tag in signatures (random, own for each session) and the host's X25519 key, whose
@@ -406,6 +426,13 @@ private:
     std::unordered_map<_ENetPeer*, uint64_t> m_idle;
     HubShards* m_shards = nullptr; ///< shared by the hub's threads; nullptr: a single hub
     size_t m_shard = 0;            ///< this thread's number
+    /// This thread's share of a core, ‰, smoothed (hub_cpu_gate): Service measures it once a second
+    uint16_t m_cpuPermille = 0;
+    uint64_t m_cpuMarkMs = 0; ///< the last sample: wall time, ms, and the thread's CPU time, µs
+    uint64_t m_cpuMarkUs = 0;
+    void MeasureCpu(uint64_t aNowMs);
+    /// A new session refused: every thread of the hub is at the CPU limit (hub_cpu_gate)
+    void RefuseBusy(_ENetPeer* aPeer);
     HubAddressBook m_ownBook;      ///< per-address request counts of a single hub
     HubAddressBook* m_book = &m_ownBook;
     std::array<uint8_t, 16> m_cookieKey{}; ///< secret of the passes: own for each hub thread, new at every start
@@ -414,6 +441,10 @@ private:
     size_t m_busySlots = 0;      ///< taken ENet slots at the last count
     size_t m_passedNoCookie = 0; ///< CONNECTs without a pass handed to ENet since then
     void CountBusy(uint64_t aNowMs);
+    /// 26.10 (hub_stop_drain): before Stop closes everything — a DISCONNECT after each connection's queue
+    /// (enet_peer_disconnect_later), at most kStopDrainMs; new connections in that time are closed at once (a host
+    /// bringing its session back must come to the next hub, not to this one going away)
+    void DrainBeforeStop();
     /// Pre-ENet waiting limit (EnetGuard.hpp); nullptr: off (Limits::guard)
     std::unique_ptr<enetguard::Guard> m_guard;
     /// Bytes in ENet's queues per slot (SendTo adds, ENet subtracts when it releases a packet) and recipients above

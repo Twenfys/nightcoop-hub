@@ -2039,20 +2039,40 @@ bool Local::OpenFromHubBox(const uint8_t aHubBox[32], uint8_t aDir, const std::v
 
 // ---------------------------------------------------------------- replay window
 
+uint64_t ReplayWindow::Span()
+{
+    return g_replayWide.load(std::memory_order_relaxed) ? kReplayWindow : kReplayWindowNarrow;
+}
+
 bool ReplayWindow::Fresh(uint64_t aCounter) const
 {
     if (aCounter == 0)
         return false;
     if (aCounter > m_top)
         return true;
-    if (m_top - aCounter >= kReplayWindow)
+    // The bits keep the whole kReplayWindow whatever the switch: within the span asked they are exact. No bits with a top
+    // cannot happen (Mark makes them) — refused all the same
+    if (m_top - aCounter >= Span() || m_bits.empty())
         return false;
     const uint64_t at = aCounter % kReplayWindow;
     return ((m_bits[at / 64] >> (at % 64)) & 1u) == 0;
 }
 
+bool ReplayWindow::TooOld(uint64_t aCounter) const
+{
+    return aCounter != 0 && aCounter <= m_top && m_top - aCounter >= Span();
+}
+
+void ReplayWindow::Reset()
+{
+    m_top = 0;
+    std::fill(m_bits.begin(), m_bits.end(), 0);
+}
+
 void ReplayWindow::Mark(uint64_t aCounter)
 {
+    if (m_bits.empty())
+        m_bits.assign(kReplayWindow / 64, 0);
     if (aCounter > m_top)
     {
         // The window slides: the slots of counters that fell out of it are for new ones. Count steps rather than
@@ -2060,7 +2080,7 @@ void ReplayWindow::Mark(uint64_t aCounter)
         const uint64_t gap = aCounter - m_top;
         if (gap >= kReplayWindow)
         {
-            m_bits.fill(0);
+            std::fill(m_bits.begin(), m_bits.end(), 0);
         }
         else
         {
@@ -2226,7 +2246,7 @@ std::vector<uint8_t> Link::Begin(const Local& aLocal, const Setup& aSetup, uint6
     m_vouched = false;
     m_reason.clear();
     m_txNext = 1;
-    m_window = ReplayWindow{};
+    m_window.Reset();
     m_txDir = aSetup.mine == Role::Host ? 1 : 2;
     m_rxDir = aSetup.mine == Role::Host ? 2 : 1;
     m_partnerKey = {};
@@ -2366,6 +2386,7 @@ bool Link::Open(const uint8_t* aData, size_t aSize, std::vector<uint8_t>& aOut, 
     if (!m_window.Fresh(counter))
     {
         m_stats.replayed += aCount ? 1 : 0;
+        m_stats.tooOld += aCount && m_window.TooOld(counter) ? 1 : 0;
         return false;
     }
     const size_t size = aSize - kOverhead;
@@ -2381,6 +2402,9 @@ bool Link::Open(const uint8_t* aData, size_t aSize, std::vector<uint8_t>& aOut, 
         return false;
     }
     aOut.resize(size);
+    // 23.10 (net_replay_wide): behind more newer ones than the old window took — a batch ENet held for a resend
+    if (counter < m_window.Top() && m_window.Top() - counter >= kReplayWindowNarrow)
+        m_stats.late += aCount ? 1 : 0;
     m_window.Mark(counter);
     ++m_stats.opened;
     m_stats.openNs += NowNs() - startedNs;
@@ -2630,7 +2654,13 @@ bool Link::Tick(const Local& aLocal, uint64_t aNowMs)
         return false;
     if (m_strict)
     {
-        Resolve(State::Refused, std::format("no key exchange from the partner in {} s", kHelloWaitMs / 1000));
+        // 23.10: say what came from the partner meanwhile — its sealed
+        // data (it is up and encrypts, its CryptoHello got lost) or nothing (another build, or the hub never told it about us)
+        Resolve(State::Refused,
+                std::format("no key exchange from the partner in {} s — {}", kHelloWaitMs / 1000,
+                            m_stats.early > 0 ? std::format("its encrypted data came ({}), its key exchange did not",
+                                                            m_stats.early)
+                                              : std::string("nothing came from it on this link")));
         return true;
     }
     // Sealed data from the partner has arrived: it encrypts and its CryptoHello is on the way — wait three times longer,
@@ -2680,14 +2710,31 @@ uint64_t Link::TakeDropped()
     return fresh;
 }
 
+uint64_t Link::TakeLate()
+{
+    const uint64_t fresh = m_stats.late - std::min(m_stats.late, m_lateReported);
+    m_lateReported = m_stats.late;
+    return fresh;
+}
+
 void ReportDrops(Link& aLink, uint32_t aPeer, const char* aWho)
 {
+    // 23.10 (net_replay_wide): what the old window would have dropped as too old
+    if (aLink.PendingLate() && log::Due(0x4352'5950'0002'0000ull ^ aPeer, 10000))
+    {
+        const uint64_t late = aLink.TakeLate();
+        log::Info("{}: crypto: {} message(s) from peer {} in the last 10 s came behind more than {} newer ones and were "
+                  "taken ({} all along; net_replay_wide — before 23.10 dropped as too old)",
+                  aWho, late, aPeer, kReplayWindowNarrow, aLink.GetStats().late);
+    }
     if (!aLink.PendingDrops() || !log::Due(0x4352'5950'0001'0000ull ^ aPeer, 10000))
         return;
     const uint64_t fresh = aLink.TakeDropped();
     const auto& s = aLink.GetStats();
     log::Warn("{}: crypto: {} message(s) from peer {} dropped in the last 10 s (link {}; all along: {} failed the check, "
-              "{} replayed or too old, {} not encrypted after the key exchange, {} encrypted before our keys)",
-              aWho, fresh, aPeer, aLink.Describe(), s.failed, s.replayed, s.plain, s.early);
+              "{} replayed or too old ({} of them behind more than {} newer ones), {} not encrypted after the key "
+              "exchange, {} encrypted before our keys)",
+              aWho, fresh, aPeer, aLink.Describe(), s.failed, s.replayed, s.tooOld, ReplayWindow::Span(), s.plain,
+              s.early);
 }
 } // namespace nc::netcrypto

@@ -14,7 +14,7 @@ namespace nc::proto
 {
 /// Wire format version: bumped on any incompatible change. Host and guests must match — a mismatch is refused at the
 /// handshake instead of surfacing later as broken state.
-inline constexpr uint32_t kVersion = 128;
+inline constexpr uint32_t kVersion = 191;
 
 /// Magic number at the start of every packet: a cheap guard against stray traffic on the port.
 inline constexpr uint32_t kMagic = 0x4E43'4F50; // 'NCOP'
@@ -78,6 +78,15 @@ enum class MsgType : uint8_t
     GameClock = 46,
     PlayerRevive = 47,
     DownedNotice = 48,
+    /// 30.10 (revive_anim): a player helping a downed partner up plays the revive animation — start (placement), stop
+    ReviveAnim = 156,
+    /// 27.10 (seq_catchup_host): a guest's steps of quest graphs (a node that waited and
+    /// then passed) — the host compares them with its own and finishes its body command a step behind all guests
+    LedProgress = 49,
+    QuestFactAck = 52, ///< the host got a guest's word about the facts of their action (deposit, document, device)
+    QuestStepBook = 53, ///< the host's write numbers of writer nodes — a guest counts its own from them
+    GuestSteps = 54,    ///< steps of open world activities a guest's graph made first — the host takes them
+    QuestState = 57,    ///< a guest asks the host's live quest state, the host answers it (QuestRewriteRules.hpp)
     VehicleSpawn = 60,
     VehicleState = 61,
     VehicleDespawn = 62,
@@ -199,7 +208,40 @@ enum class MsgType : uint8_t
     CyberwareLook = 210,
     NpcCarHit = 213,
     TurretWord = 214,
+    NpcTakeAsk = 215,   ///< take the owner's NPC into a sync animation, it is invulnerable here — only if it is there too
+    TrackModeWord = 222, ///< the host's «track the same quests» for the session (a guest follows the host's or not)
+    TrackedGoals = 223,  ///< a player's tracked objective (journal hash) and its places — partners show them
+    PhotoPose = 226,   ///< a player's photo mode V — its pose, place and weapons; "off" when photo mode closes
     VehicleRole = 227, ///< the owner's quest car role (community key of the car and of the npcs in its seats), before its spawn
+    ModsWord = 228,    ///< mods check at session entry — the mods fingerprint, the list by hashes, names of the difference
+    VehicleRider = 230, ///< a player standing on a shared vehicle (its roof, its bed): their place in its axes
+    VehicleColor = 236, ///< the owner's paint of a player vehicle (the game's visual customization template)
+    RewardWord = 238,   ///< the host's quest reward for guests; an NPC owner's word "your player neutralized it" to the partner
+    SpawnWord = 241,    ///< the open world population system, one envelope with a u16 sub-kind 257..263
+    DeviceFacts = 246,  ///< a guest's quest facts set by a device's own operation on their custom action
+    CarWord = 248,      ///< a player's quickhack of a partner's car (brakes, explode, speed up) — for its owner to run
+    CarHit = 232,       ///< a player's hit on the mirror of a partner's car — for its owner's quest conditions «hit by the player»
+    CarClaim = 233,     ///< the damage a player's hit did to the mirror of a partner's car — for its owner to take
+    NpcHit = 235,       ///< a player's hit on a partner's NPC that did no damage here — for its owner's quest conditions «hit by the player»
+    VoteModeWord = 249, ///< the host's choice voting mode for the session (majority / everyone)
+    PerkTime = 251,     ///< a player's perk slows time (Deep Breath, High Noon) — its pace, 1 when it is over
+    SyncSave = 254,     ///< the host saved (guests snapshot their character for that save) or loaded a save (its stamp)
+    TimeSkipWord = 253, ///< the game fast-forwarded the host's player after its time skip — guests do the same to theirs
+    OwnRise = 224,      ///< a player lies by the game's own death, but their own Second Heart gets them up
+    ModWord = 200,      ///< data of a mod that uses the NightCoop SDK — channels, shared state, entity state, passports
+    PoseWord = 201,     ///< a player's pose source (VR head and hands, aim along the barrel) for partners
+    SpawnShare = 202,   ///< an entity a mod spawned and shared — its copy on partners, the owner leads it
+    BossWord = 252,     ///< a boss owner's word to the others — its health multiplier by the players in the fight
+    LiftAccess = 244,   ///< who a quest keycard lift lets in — a guest's own to the host, the session's to guests
+    QuestItemWord = 245, ///< a player gained or handed over a quest item — the others' inventories follow (quest_items_shared)
+    WorldItemWord = 143, ///< a player took a world item at the game's place of its object — the others take theirs there (loot_world_own)
+    CorpseWord = 247,   ///< a corpse's owner to the others — the corpse (number, who, place) or «the corpse is gone»
+    SpawnViewCamera = 204, ///< a player's camera (place, look on the ground, half view angle) — no game spawns where it sees
+    PhoneHold = 205,    ///< a player's phone state — what holds its phone's interruption (combat, wanted 3+, …), its place in the interruption round
+    DialogLocks = 216,  ///< a guest's choice windows — which options are locked for its V (a blue-line check failed there)
+    RestrictSet = 211,  ///< a player's gameplay restrictions with the source of every stack, at world entry and on change (witness)
+    WeatherWord = 206,  ///< the host's weather — its current state and request (source, blend, priority, random cycle), on change and to a guest entering its world
+    RaceWord = 50,      ///< a race with every player in their own car — the host's dropped NPC teams and a guest's place at the start, the start, a guest's finish, the result and the winner
 };
 
 /// Recipient "everyone but the sender" in HubPayload.
